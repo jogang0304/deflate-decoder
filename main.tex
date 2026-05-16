@@ -1,0 +1,321 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setmainlanguage{russian}
+\setotherlanguage{english}
+\setmainfont{IBM Plex Serif}
+\setmonofont{IBM Plex Mono}[Scale=0.75]
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\geometry{
+  left=1cm, right=1cm,
+  top=2cm, bottom=2cm
+}
+
+\begin{document}
+
+\title{Декодер DEFLATE (RFC 1951)}
+\author{Головин Иван, Б05-304}
+\date{}
+
+\maketitle
+
+% ============================================================
+\section{Постановка задачи}
+
+\subsection{Неформальная постановка}
+
+Надо написать программу, декодирующую данные, сжатые алгоритмом DEFLATE. Реализация выполняется на языке Haskell
+без внешних библиотек.
+
+\subsection{Формальная постановка}
+
+Пусть входные данные задаются строкой в кодировке Base64, которая передаётся
+единственным аргументом командной строки. Программа должна выводить декодированные
+данные в стандартный вывод.
+
+\subsubsection{Входная строка Base64}
+
+Алфавит Base64: $\Sigma_{64} = \{\,\text{A}\dots\text{Z},\ \text{a}\dots\text{z},\ \text{0}\dots\text{9},\ \text{+},\ \text{/}\,\}$.
+
+\[
+\begin{aligned}
+Base64String &\ \to\  Group^*\  FinalGroup \\
+Group        &\ \to\  c_1\,c_2\,c_3\,c_4,\quad c_i \in \Sigma_{64} \\
+FinalGroup   &\ \to\  c_1\,c_2\,c_3\,c_4 \ \mid\  c_1\,c_2\,c_3\,\text{=} \ \mid\  c_1\,c_2\,\text{==}
+\end{aligned}
+\]
+
+Каждые четыре символа кодируют три байта (24 бита). Символ '=' является
+заполнителем и означает, что последняя группа кодирует меньше байт.
+
+\subsubsection{Поток байт DEFLATE}
+
+Согласно RFC\,1951 поток байт DEFLATE представляет собой последовательность
+блоков:
+
+\[
+DeflateStream \ \to\  Block^+
+\]
+
+Каждый блок начинается заголовком из трёх бит:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Поле & Биты & Значение \\
+\midrule
+\textsc{bfinal} & 1 & 1 если это последний блок \\
+\textsc{btype}  & 2 & тип блока (00, 01, 10) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Типы блоков:
+\[
+Block \ \to\
+  \textsc{bfinal}\ \textsc{btype}\
+  \begin{cases}
+    StoredBlock  & \text{если } \textsc{btype} = 00_2 \\
+    FixedBlock   & \text{если } \textsc{btype} = 01_2 \\
+    DynamicBlock & \text{если } \textsc{btype} = 10_2
+  \end{cases}
+\]
+
+\paragraph{Блок без сжатия ($\textsc{btype} = 00_2$):}
+\[
+StoredBlock \ \to\
+  \underbrace{padding}_{\text{выравнивание до байта}}\
+  \underbrace{LEN}_{\text{2 байта}}\
+  \underbrace{NLEN}_{\text{дополнение}}\
+  \underbrace{byte^{LEN}}_{\text{данные}}
+\]
+
+\paragraph{Блок с фиксированными кодами ($\textsc{btype} = 01_2$):}
+\[
+FixedBlock \ \to\  Symbol^*\  EOB
+\]
+где таблицы кодов Хаффмана фиксированы стандартом (раздел~\ref{sec:fixed}).
+
+\paragraph{Блок с динамическими кодами ($\textsc{btype} = 10_2$):}
+\[
+DynamicBlock \ \to\
+  \underbrace{HLIT}_{\text{5 бит}}\
+  \underbrace{HDIST}_{\text{5 бит}}\
+  \underbrace{HCLEN}_{\text{4 бита}}\
+  \underbrace{CodeLenCodes}_{\text{HCLEN+4 групп по 3 бита}}\
+  \underbrace{LitLenCodes}_{\text{HLIT+257 значений}}\
+  \underbrace{DistCodes}_{\text{HDIST+1 значений}}\
+  Symbol^*\  EOB
+\]
+
+\paragraph{Символы (LZ77-пары):}
+\[
+Symbol \ \to\
+  \begin{cases}
+    literal                   & \text{код } 0\dots255\text{: байт данных} \\
+    EOB                       & \text{код } 256\text{: конец блока} \\
+    LenCode\ DistCode& \text{код } 257\dots285\text{: пара (длина, дистанция)}
+  \end{cases}
+\]
+
+\subsubsection{Задача декодирования}
+
+Пусть $f_{b64}: \Sigma_{64}^* \to \{0,\dots,255\}^*$ — функция декодирования Base64,
+$f_{def}: \{0,\dots,255\}^* \to \{0,\dots,255\}^*$ — функция декодирования DEFLATE.
+
+Требуется реализовать функцию:
+\[
+\boxed{
+  F(s) \ =\  f_{def}\!\left( f_{b64}(s) \right),
+  \quad s \in \Sigma_{64}^*
+}
+\]
+и вывести $F(s)$, интерпретируя байты как символы UTF-8.
+
+% ============================================================
+\section{Используемые алгоритмы}
+
+\subsection{Декодирование Base64}
+
+Base64 кодирует каждые 3 байта (24 бита) четыремя символами из алфавита $\Sigma_{64}$, потому что каждый символ несёт 6 бит информации ($\log_2 64 = 6$).
+
+\paragraph{Алгоритм.}
+\begin{enumerate}
+  \item Разбить строку на группы по 4 символа.
+  \item Для каждого символа $c$ найти его номер $v(c) \in [0,63]$.
+  \item Склеить 4 числа по 6 бит в 24-битное целое:
+        $n = v(c_1) \cdot 2^{18} + v(c_2) \cdot 2^{12} + v(c_3) \cdot 2^6 + v(c_4)$.
+  \item Извлечь три байта: $b_1 = n \gg 16$,\  $b_2 = (n \gg 8)\ \&\ \text{0xFF}$,\  $b_3 = n\ \&\ \text{0xFF}$.
+  \item Если последняя группа оканчивается на '=': одним '=' - выдать 2 байта;
+        двумя - выдать 1 байт.
+\end{enumerate}
+
+\subsection{Монадический парсер битового потока}
+
+Всё декодирование построено на типе:
+\[
+\text{type BitParser a = StateT BitState Maybe a}
+\]
+
+где \text{BitState} хранит список оставшихся байт и позицию следующего бита
+внутри текущего байта (0 = LSB). Использование монады \text{StateT} позволяет
+передавать состояние потока неявно через монадическую цепочку, а монада
+\text{Maybe} обеспечивает "отказ" при несоответствии входных данных.
+
+\paragraph{Порядок битов в DEFLATE.}
+
+Биты внутри байта читаются от младшего к старшему (LSB first).
+Коды Хаффмана при этом интерпретируются в обратном порядке:
+первый прочитанный бит является старшим битом кода.
+
+\subsection{Коды Хаффмана}
+\label{sec:huffman}
+
+\subsubsection{Построение дерева по длинам кодов}
+
+RFC 1951 задаёт таблицы Хаффмана не явным перечислением кодов,
+а списком длин кодов для каждого символа. Дерево восстанавливается
+по следующему алгоритму:
+
+\begin{enumerate}
+  \item Подсчитать $bl\_count[l]$ — количество кодов длины $l$.
+  \item Вычислить начальный код для каждой длины:
+        \[
+          next\_code[1] = 0;\quad
+          next\_code[l+1] = \left(next\_code[l] + bl\_count[l]\right) \cdot 2.
+        \]
+  \item Присвоить каждому символу с длиной $l$ очередной код $next\_code[l]$,
+        после чего увеличить $next\_code[l]$ на 1.
+  \item Вставить тройки $(\text{ символ}, \text{ длина}, \text{ код})$
+        в бинарное дерево, спускаясь по битам кода от старшего к младшему:
+        бит 0 — в левого ребёнка, бит 1 — в правого.
+\end{enumerate}
+
+\subsubsection{Декодирование символа}
+
+Начиная с корня дерева, читать по одному биту и переходить
+в левого (бит=0) или правого (бит=1) ребёнка. Достигнув листа,
+вернуть хранящееся там значение.
+
+\subsubsection{Фиксированные таблицы}
+\label{sec:fixed}
+
+При $\textsc{btype}=01_2$ таблица задана стандартом:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Символы & Длина кода & Примечание \\
+\midrule
+0--143   & 8 бит & литералы (ASCII + расширенный) \\
+144--255 & 9 бит & литералы выше 127 \\
+256--279 & 7 бит & EOB + коды длин \\
+280--287 & 8 бит & коды длин \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Дистанции кодируются 5-битными кодами (30 значений, длина 5 для всех).
+
+\subsection{Алгоритм LZ77 (декодирование)}
+
+DEFLATE использует LZ77-сжатие: повторяющиеся фрагменты заменяются
+ссылкой (длина, дистанция). При декодировании надо:
+
+\begin{enumerate}
+  \item Прочитать символ из таблицы литералов/длин.
+  \item Если символ $< 256$: добавить байт в выходной буфер.
+  \item Если символ $= 256$: конец блока.
+  \item Если символ $\in [257, 285]$:
+    \begin{enumerate}
+      \item Вычислить длину: $L = base\_len[code-257] + \text{extra bits}$.
+      \item Прочитать код дистанции из дерева дистанций.
+      \item Вычислить дистанцию: $D = base\_dist[dist\_code] + \text{extra bits}$.
+      \item Скопировать $L$ байт из позиции $(len(buf) - D)$ выходного буфера.
+            Копирование может перекрываться (если $L > D$), что реализует RLE.
+    \end{enumerate}
+\end{enumerate}
+
+Таблицы кодов длин и дистанций в коде называются, соответственно, $lengthTable$ и $distTable$
+
+\subsection{Декодирование динамических таблиц Хаффмана}
+
+При $\textsc{btype}=10_2$ таблицы передаются в самом потоке,
+что позволяет адаптировать коды под конкретные данные.
+
+\paragraph{Алгоритм.}
+\begin{enumerate}
+  \item Прочитать $HLIT$ (5 бит), $HDIST$ (5 бит), $HCLEN$ (4 бита).
+        Количество кодов: литералы = $HLIT+257$, дистанции = $HDIST+1$,
+        коды = $HCLEN+4$.
+  \item Прочитать $HCLEN+4$ трёхбитных значения в порядке:\\
+        $[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]$.
+        Это длины кодов для дерева.
+  \item Построить дерево Хаффмана.
+  \item С помощью дерева прочитать $(HLIT+257) + (HDIST+1)$
+        длин кодов:
+        \begin{itemize}
+          \item Код $0\dots15$: прямое значение длины.
+          \item Код $16$: повторить предыдущую длину $3+\text{(2 бита)}$ раз.
+          \item Код $17$: $3+\text{(3 бита)}$ нулей.
+          \item Код $18$: $11+\text{(7 бит)}$ нулей.
+        \end{itemize}
+  \item Построить деревья литералов и дистанций.
+\end{enumerate}
+
+% ============================================================
+\section{Архитектура программы}
+
+Программа организована как единственный модуль Main со следующими
+логическими блоками:
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+Блок & Ответственность \\
+\midrule
+\text{BitState} / \text{BitParser} & Тип состояния и монада битового парсера \\
+\text{bit}, \text{bits}, \text{rawByte} & Примитивы чтения битов и байт \\
+\text{decodeBase64} & Декодирование входной строки Base64 \\
+\text{HuffmanTree}, \text{buildFromList}, \text{assignCodes} & Дерево Хаффмана и его построение \\
+\text{decodeSymbol} & Чтение одного символа по дереву \\
+\text{fixedLitLenTree}, \text{fixedDistTree} & Фиксированные таблицы RFC\,1951 \\
+\text{lengthTable}, \text{distTable} & Таблицы длин и дистанций LZ77 \\
+\text{decodeLZ} & Основной цикл LZ77-декодирования \\
+\text{decodeDynTrees} & Чтение динамических таблиц Хаффмана \\
+\text{decodeCodeLengths} & RLE-раскодирование длин кодов \\
+\text{decodeStored} & Раскодирование блока без сжатия \\
+\text{decodeBlocks} & Цикл по блокам DEFLATE \\
+\text{decompressBase64} & Точка входа в декодирование \\
+\text{main} & Обработка аргументов командной строки \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Конвейер обработки данных}
+
+\[
+\text{String (Base64)}
+\ \xrightarrow{f_{b64}}\
+\text{[Word8]}
+\ \xrightarrow{\text{BitState}}\
+\text{BitParser}
+\ \xrightarrow{\text{decodeBlocks}}\
+\text{[Word8]}
+\ \xrightarrow{\text{toEnum}}\
+\text{String}
+\]
+
+\end{document}
